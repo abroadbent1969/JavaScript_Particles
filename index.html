@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Particle System with Mouse Vortex and Media Shape Formation</title>
+    <style>
+        canvas {
+            border: 1px solid black;
+            margin: 20px;
+            background: #1a1a1a;
+        }
+        body {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            font-family: Arial, sans-serif;
+            margin: 0;
+            background: #000;
+        }
+        #controls {
+            margin-bottom: 10px;
+            color: white;
+        }
+        #mediaInput {
+            margin-top: 10px;
+        }
+        button {
+            margin-left: 10px;
+        }
+        select, input[type="range"], input[type="number"], input[type="checkbox"] {
+            margin-left: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div id="controls">
+        <label for="particleCount">Particles (10-1000): </label>
+        <input type="number" id="particleCount" value="500" min="10" max="1000">
+        <label for="darknessThreshold" style="margin-left: 20px;">Darkness Threshold (0-1): </label>
+        <input type="range" id="darknessThreshold" min="0" max="1" step="0.01" value="0.85">
+        <span id="thresholdValue">0.85</span>
+        <label for="particleSize" style="margin-left: 20px;">Particle Size (0.5-5): </label>
+        <input type="range" id="particleSize" min="0.5" max="5" step="0.1" value="1">
+        <span id="sizeValue">1</span>
+        <label for="showMedia" style="margin-left: 20px;">Show Media: </label>
+        <input type="checkbox" id="showMedia" checked>
+        <label for="behaviorMode" style="margin-left: 20px;">Behavior: </label>
+        <select id="behaviorMode">
+            <option value="attract">Attract</option>
+            <option value="orbit">Orbit</option>
+        </select>
+        <button onclick="resetParticles()">Reset</button>
+        <button onclick="closeMedia()">Close Media</button>
+        <p>Use the left mouse button to create a vortex at the cursor position. Upload video or image to use for particles position.</p>
+        <input type="file" id="mediaInput" accept="video/*,image/png,image/jpeg">
+    </div>
+    <canvas id="canvas" width="800" height="600"></canvas>
+
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        let particles = [];
+        let controller = { x: null, y: null };
+        let vortex = null;
+        let darkAttractors = [];
+        let darkPixels = [];
+        let mouse = { x: null, y: null, down: false };
+        let darknessThreshold = 0.85; // Default threshold
+        let particleSizeScale = 1; // Default size scale
+        let behaviorMode = 'attract'; // Default behavior
+        let lastAnalysisTime = 0;
+        const analysisInterval = 0.1; // Analyze every 100ms
+
+        // Hidden video element for playback
+        const video = document.createElement('video');
+        video.loop = true;
+        video.muted = true;
+        let videoLoaded = false;
+
+        // Hidden image element for static images
+        const image = new Image();
+        let imageLoaded = false;
+
+        // Hidden canvas for media frame processing
+        const hiddenCanvas = document.createElement('canvas');
+        const hiddenCtx = hiddenCanvas.getContext('2d');
+
+        // Particle types
+        const particleTypes = [
+            {
+                name: 'circle',
+                baseSize: 1.5,
+                speed: 0.8,
+                draw: (p) => {
+                    ctx.beginPath();
+                    ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+                    ctx.fillStyle = p.color;
+                    ctx.fill();
+                }
+            },
+            {
+                name: 'square',
+                baseSize: 2,
+                speed: 0.6,
+                draw: (p) => {
+                    ctx.fillStyle = p.color;
+                    ctx.fillRect(p.x - p.size, p.y - p.size, p.size * 2, p.size * 2);
+                }
+            },
+            {
+                name: 'star',
+                baseSize: 1.8,
+                speed: 1,
+                draw: (p) => {
+                    ctx.beginPath();
+                    ctx.moveTo(p.x, p.y - p.size);
+                    for (let i = 0; i < 5; i++) {
+                        ctx.lineTo(
+                            p.x + Math.sin((i * 4 + 2) * Math.PI / 5) * p.size * 0.5,
+                            p.y - Math.cos((i * 4 + 2) * Math.PI / 5) * p.size * 0.5
+                        );
+                        ctx.lineTo(
+                            p.x + Math.sin((i * 4 + 4) * Math.PI / 5) * p.size,
+                            p.y - Math.cos((i * 4 + 4) * Math.PI / 5) * p.size
+                        );
+                    }
+                    ctx.closePath();
+                    ctx.fillStyle = p.color;
+                    ctx.fill();
+                }
+            }
+        ];
+
+        class Particle {
+            constructor() {
+                // Spawn particles randomly if darkPixels is empty, else near dark pixels
+                if (darkPixels.length > 0) {
+                    const idx = Math.floor(Math.random() * darkPixels.length);
+                    this.x = darkPixels[idx].x + (Math.random() - 0.5) * 5;
+                    this.y = darkPixels[idx].y + (Math.random() - 0.5) * 5;
+                    // Sample color from hidden canvas
+                    const pixelData = hiddenCtx.getImageData(this.x, this.y, 1, 1).data;
+                    this.color = `rgba(${pixelData[0]}, ${pixelData[1]}, ${pixelData[2]}, 0.9)`;
+                } else {
+                    this.x = Math.random() * canvas.width;
+                    this.y = Math.random() * canvas.height;
+                    this.hue = Math.random() * 360;
+                    this.color = `hsla(${this.hue}, 80%, 60%, 0.9)`;
+                }
+                this.type = particleTypes[Math.floor(Math.random() * particleTypes.length)];
+                this.baseSize = this.type.baseSize;
+                this.size = this.baseSize * particleSizeScale;
+                this.vx = (Math.random() - 0.5) * this.type.speed;
+                this.vy = (Math.random() - 0.5) * this.type.speed;
+                this.phase = Math.random() * Math.PI * 2;
+                console.log(`Particle created at (${this.x}, ${this.y})`);
+            }
+
+            update(time) {
+                this.size = this.baseSize * particleSizeScale * (1 + 0.1 * Math.sin(time + this.phase));
+                this.x += this.vx;
+                this.y += this.vy;
+
+                if (this.x < 0 || this.x > canvas.width) this.vx *= -1;
+                if (this.y < 0 || this.y > canvas.height) this.vy *= -1;
+
+                if (controller.x !== null && controller.y !== null) {
+                    let dx = controller.x - this.x;
+                    let dy = controller.y - this.y;
+                    let distance = Math.sqrt(dx * dx + dy * dy);
+                    if (distance > 0 && distance < 200) {
+                        let force = (200 - distance) / 200 * 0.01;
+                        this.vx += dx * force / distance;
+                        this.vy += dy * force / distance;
+                    }
+                }
+
+                if (darkAttractors.length > 0) {
+                    let nearest = darkAttractors.reduce((closest, a) => {
+                        let dx = a.x - this.x;
+                        let dy = a.y - this.y;
+                        let distance = Math.sqrt(dx * dx + dy * dy);
+                        if (!closest || distance < closest.distance) {
+                            return { x: a.x, y: a.y, darkness: a.darkness, distance };
+                        }
+                        return closest;
+                    }, null);
+
+                    if (nearest && nearest.distance < 100) {
+                        let dx = nearest.x - this.x;
+                        let dy = nearest.y - this.y;
+                        let distance = nearest.distance;
+                        if (behaviorMode === 'attract') {
+                            let force = nearest.darkness * (100 - distance) / 100 * 0.03;
+                            this.vx += dx * force / distance;
+                            this.vy += dy * force / distance;
+                        } else if (behaviorMode === 'orbit') {
+                            let angle = Math.atan2(dy, dx);
+                            let orbitSpeed = nearest.darkness * 0.05;
+                            this.vx += -Math.sin(angle) * orbitSpeed;
+                            this.vy += Math.cos(angle) * orbitSpeed;
+                        }
+                    }
+                }
+
+                if (vortex) {
+                    let dx = vortex.x - this.x;
+                    let dy = vortex.y - this.y;
+                    let distance = Math.sqrt(dx * dx + dy * dy);
+                    if (distance > 0 && distance < vortex.radius) {
+                        let strength = vortex.strength * (1 - distance / vortex.radius) * 0.5;
+                        let angle = Math.atan2(dy, dx);
+                        this.vx += strength * -Math.sin(angle);
+                        this.vy += strength * Math.cos(angle);
+                        this.vx -= (dx / distance) * strength * 0.5;
+                        this.vy -= (dy / distance) * strength * 0.5;
+                    }
+                }
+
+                this.vx *= 0.98;
+                this.vy *= 0.98;
+            }
+
+            draw() {
+                this.type.draw(this);
+            }
+        }
+
+        function connectParticles() {
+            const maxDistance = 50;
+            for (let i = 0; i < particles.length; i++) {
+                for (let j = i + 1; j < particles.length; j++) {
+                    let dx = particles[i].x - particles[j].x;
+                    let dy = particles[i].y - particles[j].y;
+                    let distance = Math.sqrt(dx * dx + dy * dy);
+                    if (distance < maxDistance) {
+                        ctx.beginPath();
+                        ctx.moveTo(particles[i].x, particles[i].y);
+                        ctx.lineTo(particles[j].x, particles[j].y);
+                        let avgHue = (particles[i].hue + particles[j].hue) / 2 + 180 % 360;
+                        ctx.strokeStyle = `hsla(${avgHue}, 80%, 60%, ${0.5 - distance / maxDistance})`;
+                        ctx.lineWidth = 0.5;
+                        ctx.stroke();
+                    }
+                }
+            }
+        }
+
+        function analyzeMediaFrame() {
+            if (!videoLoaded && !imageLoaded) return;
+
+            hiddenCanvas.width = canvas.width;
+            hiddenCanvas.height = canvas.height;
+            if (videoLoaded && !video.paused) {
+                hiddenCtx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                console.log(`Video frame at ${video.currentTime}s`);
+            } else if (imageLoaded) {
+                hiddenCtx.drawImage(image, 0, 0, canvas.width, canvas.height);
+            }
+            const imageData = hiddenCtx.getImageData(0, 0, canvas.width, canvas.height);
+            const data = imageData.data;
+            darkAttractors = [];
+            darkPixels = [];
+
+            const step = 10;
+            for (let y = 0; y < canvas.height; y += step) {
+                for (let x = 0; x < canvas.width; x += step) {
+                    let index = (y * canvas.width + x) * 4;
+                    let r = data[index];
+                    let g = data[index + 1];
+                    let b = data[2];
+                    let brightness = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+                    let darkness = 1 - brightness;
+                    if (darkness > darknessThreshold) {
+                        darkAttractors.push({ x, y, darkness });
+                        darkPixels.push({ x, y });
+                    }
+                }
+            }
+            console.log(`Frame analyzed - Attractors found: ${darkAttractors.length}, Threshold: ${darknessThreshold}`);
+        }
+
+        function initParticles(count) {
+            particles = [];
+            for (let i = 0; i < count; i++) {
+                particles.push(new Particle());
+            }
+            console.log(`Initialized ${particles.length} particles`);
+        }
+
+        function closeMedia() {
+            video.pause();
+            video.src = '';
+            videoLoaded = false;
+            image.src = '';
+            imageLoaded = false;
+            darkAttractors = [];
+            darkPixels = [];
+            darknessThreshold = 0.85;
+            thresholdSlider.value = darknessThreshold;
+            thresholdValueDisplay.textContent = darknessThreshold.toFixed(2);
+            particleSizeScale = 1;
+            sizeSlider.value = particleSizeScale;
+            sizeValueDisplay.textContent = particleSizeScale.toFixed(1);
+            behaviorMode = 'attract';
+            behaviorModeSelect.value = behaviorMode;
+            resetParticles();
+            console.log('Media closed, particles reset');
+        }
+
+        let time = 0;
+        function animate() {
+            ctx.fillStyle = 'rgba(26, 26, 26, 0.1)'; // Faint trails
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            time += 1 / 60;
+
+            if (time - lastAnalysisTime >= analysisInterval) {
+                analyzeMediaFrame();
+                lastAnalysisTime = time;
+            }
+
+            const showMedia = document.getElementById('showMedia').checked;
+            if (showMedia) {
+                if (videoLoaded && !video.paused) {
+                    ctx.globalAlpha = 0.2;
+                    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                    ctx.globalAlpha = 1;
+                } else if (imageLoaded) {
+                    ctx.globalAlpha = 0.2;
+                    ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
+                    ctx.globalAlpha = 1;
+                }
+            }
+
+            particles.forEach(p => {
+                p.update(time);
+                p.draw();
+            });
+
+            connectParticles();
+
+            if (vortex) {
+                if (mouse.down && mouse.x !== null) {
+                    vortex.x = mouse.x;
+                    vortex.y = mouse.y;
+                }
+                vortex.duration -= 1 / 60;
+                if (vortex.duration <= 0 || !mouse.down) vortex = null;
+                else {
+                    ctx.beginPath();
+                    ctx.arc(vortex.x, vortex.y, vortex.radius, 0, Math.PI * 2);
+                    ctx.strokeStyle = 'rgba(255, 255, 255, 0.3)';
+                    ctx.lineWidth = 1;
+                    ctx.stroke();
+                }
+            }
+
+            console.log(`Frame rendered, particles: ${particles.length}`);
+            requestAnimationFrame(animate);
+        }
+
+        function resetParticles() {
+            const count = parseInt(document.getElementById('particleCount').value);
+            initParticles(Math.max(10, Math.min(1000, count)));
+        }
+
+        // Media loading
+        const mediaInput = document.getElementById('mediaInput');
+        mediaInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                const url = URL.createObjectURL(file);
+                if (file.type.startsWith('video/')) {
+                    video.src = url;
+                    video.onloadeddata = () => {
+                        videoLoaded = true;
+                        imageLoaded = false;
+                        video.play();
+                        video.addEventListener('ended', () => {
+                            video.currentTime = 0;
+                            video.play();
+                        });
+                        resetParticles();
+                        console.log('Video loaded, particles reset');
+                    };
+                } else if (file.type === 'image/png' || file.type === 'image/jpeg') {
+                    image.src = url;
+                    image.onload = () => {
+                        imageLoaded = true;
+                        videoLoaded = false;
+                        video.pause();
+                        video.src = '';
+                        resetParticles();
+                        console.log('Image loaded, particles reset');
+                    };
+                }
+            }
+        });
+
+        // Mouse handling for vortex
+        canvas.addEventListener('mousemove', (e) => {
+            const rect = canvas.getBoundingClientRect();
+            mouse.x = e.clientX - rect.left;
+            mouse.y = e.clientY - rect.top;
+        });
+
+        canvas.addEventListener('mousedown', () => {
+            mouse.down = true;
+            if (mouse.x !== null && !vortex) {
+                vortex = {
+                    x: mouse.x,
+                    y: mouse.y,
+                    radius: 70,
+                    strength: 0.2,
+                    duration: Infinity
+                };
+            }
+        });
+
+        canvas.addEventListener('mouseup', () => {
+            mouse.down = false;
+            vortex = null;
+        });
+
+        canvas.addEventListener('mouseleave', () => {
+            mouse.x = null;
+            mouse.y = null;
+            mouse.down = false;
+            vortex = null;
+        });
+
+        // Xbox controller handling
+        let vortexButtonPressed = false;
+        window.addEventListener('gamepadconnected', (e) => {
+            console.log('Gamepad connected:', e.gamepad.id);
+        });
+
+        window.addEventListener('gamepaddisconnected', (e) => {
+            console.log('Gamepad disconnected:', e.gamepad.id);
+            controller.x = null;
+            controller.y = null;
+        });
+
+        function handleGamepad() {
+            const gamepads = navigator.getGamepads();
+            for (const gamepad of gamepads) {
+                if (gamepad) {
+                    const axisX = gamepad.axes[0];
+                    const axisY = gamepad.axes[1];
+                    controller.x = (axisX + 1) / 2 * canvas.width;
+                    controller.y = (axisY + 1) / 2 * canvas.height;
+                }
+            }
+        }
+
+        function pollGamepad() {
+            handleGamepad();
+            requestAnimationFrame(pollGamepad);
+        }
+
+        pollGamepad();
+
+        // Slider handling for darkness threshold
+        const thresholdSlider = document.getElementById('darknessThreshold');
+        const thresholdValueDisplay = document.getElementById('thresholdValue');
+        thresholdSlider.addEventListener('input', () => {
+            darknessThreshold = parseFloat(thresholdSlider.value);
+            thresholdValueDisplay.textContent = darknessThreshold.toFixed(2);
+            resetParticles();
+            console.log(`Threshold updated to ${darknessThreshold}`);
+        });
+
+        // Slider handling for particle size
+        const sizeSlider = document.getElementById('particleSize');
+        const sizeValueDisplay = document.getElementById('sizeValue');
+        sizeSlider.addEventListener('input', () => {
+            particleSizeScale = parseFloat(sizeSlider.value);
+            sizeValueDisplay.textContent = particleSizeScale.toFixed(1);
+            particles.forEach(p => {
+                p.size = p.baseSize * particleSizeScale;
+            });
+            console.log(`Particle size scale updated to ${particleSizeScale}`);
+        });
+
+        // Behavior mode handling
+        const behaviorModeSelect = document.getElementById('behaviorMode');
+        behaviorModeSelect.addEventListener('change', () => {
+            behaviorMode = behaviorModeSelect.value;
+            console.log(`Behavior mode changed to ${behaviorMode}`);
+        });
+
+        // Initialize and start
+        initParticles(500);
+        animate();
+    </script>
+</body>
+</html>
